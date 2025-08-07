@@ -1,0 +1,14 @@
+PyPDF2
+
+langchain
+
+openai
+
+faiss-cpu
+
+transformers
+sentence-transformers
+accelerate
+torch
+
+python-dotenv
