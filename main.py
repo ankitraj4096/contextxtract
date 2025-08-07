@@ -20,7 +20,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, HttpUrl
 
-#### ---- AUTH SETTINGS (update your API_KEY here if needed) ---- ####
+#### ---- AUTH SETTINGS ---- ####
 API_KEY = "f5b00b57698f28dbb878319109a149d5cd0a7d430c25cf3c590b30d31cf8b028"
 
 app = FastAPI(
@@ -41,7 +41,7 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme
     return credentials
 
 class HackRxRequest(BaseModel):
-    documents: HttpUrl  # pdf file URL
+    documents: HttpUrl
     questions: List[str]
 
 class HackRxResponse(BaseModel):
@@ -66,8 +66,6 @@ class RAGPipeline:
         self.documents = []
         self.embeddings = None
         self.faiss_index = None
-        self.vector_db_path = "faiss_index"  # unused in API version
-        self.documents_path = "documents.pkl" # unused in API version
 
     def read_pdf(self, pdf_path: str) -> str:
         text = ""
@@ -93,7 +91,7 @@ class RAGPipeline:
         text = text.strip()
         return text
 
-    def chunk_text(self, text: str, chunk_size: int = 50, overlap: int = 5) -> List[Document]:
+    def chunk_text(self, text: str, chunk_size: int = 200, overlap: int = 50) -> List[Document]:  # CHANGED: Increased chunk size
         documents = []
         words = text.split()
         for i in range(0, len(words), chunk_size - overlap):
@@ -119,7 +117,7 @@ class RAGPipeline:
         self.faiss_index = faiss.IndexFlatL2(dimension)
         self.faiss_index.add(embeddings.astype("float32"))
 
-    def process_pdf(self, pdf_path: str, chunk_size: int = 50, overlap: int = 5):
+    def process_pdf(self, pdf_path: str, chunk_size: int = 200, overlap: int = 50):  # CHANGED: Updated defaults
         raw_text = self.read_pdf(pdf_path)
         if not raw_text:
             raise Exception("No text could be extracted from the PDF.")
@@ -143,14 +141,15 @@ class RAGPipeline:
         combined_context = " ... ".join(contexts)
         return combined_context
 
-    def search_similar(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:  # CHANGED: Increased top_k
         if self.faiss_index is None:
             raise Exception("FAISS index not built.")
         query_embedding = self.embedding_model.encode([query])
         distances, indices = self.faiss_index.search(query_embedding.astype("float32"), top_k)
+        
         results = []
         for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
-            if idx != -1:
+            if idx != -1 and idx < len(self.documents):
                 doc = self.documents[idx]
                 query_words = query.split()
                 context = self.get_context_window(doc.content, query_words, context_size=100)
@@ -163,45 +162,89 @@ class RAGPipeline:
                 })
         return results
 
+    # CHANGED: Completely updated prompt and response cleaning
+    def clean_response(self, response_text: str) -> str:
+        """Clean the response by removing <think> tags and formatting properly"""
+        # Remove <think>...</think> blocks
+        cleaned = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL)
+        
+        # Remove extra whitespace and newlines
+        cleaned = re.sub(r'\n+', ' ', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        
+        # Clean up any remaining artifacts
+        cleaned = cleaned.strip()
+        
+        # If response is empty after cleaning, return a default message
+        if not cleaned:
+            return "The information requested could not be found in the provided context."
+        
+        return cleaned
+
     def generate_answer(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
+        if not context_docs:
+            return "No relevant context found to answer the question."
+            
         context_parts = []
         for doc in context_docs:
             context_parts.append(f"Context {doc['rank']}: {doc['context']}")
         combined_context = "\n\n".join(context_parts)
-        prompt = f"""Based on the following context documents, please answer the question. Use the context to provide accurate and relevant information.
+        
+        # CHANGED: Improved prompt to get direct, concise answers
+        prompt = f"""You are an insurance policy expert. Based on the provided context, answer the question directly and concisely.
 
-Context Documents:
+Context:
 {combined_context}
 
 Question: {query}
 
-Please provide a comprehensive answer based on the context provided. If the context doesn't contain enough information to fully answer the question, please state that clearly."""
+Instructions:
+- Provide a direct, factual answer
+- Be specific with numbers, periods, and conditions when mentioned
+- Keep the answer concise but complete
+- If specific details aren't in the context, state that clearly
+- Do not include reasoning or thought processes in your response"""
+        
         try:
             response = self.groq_client.chat.completions.create(
                 model="deepseek-r1-distill-llama-70b",
                 messages=[
-                    { "role": "system", "content": "Answer these questions the best you can." },
+                    { 
+                        "role": "system", 
+                        "content": "You are a helpful insurance policy assistant. Provide direct, concise answers based only on the provided context. Do not show your reasoning process." 
+                    },
                     { "role": "user", "content": prompt },
                 ],
-                temperature=0.1,
-                max_tokens=1000,
+                temperature=0.0,  # CHANGED: Set to 0 for more consistent outputs
+                max_tokens=500,   # CHANGED: Reduced for more concise answers
             )
-            return response.choices[0].message.content
+            
+            raw_response = response.choices[0].message.content
+            # CHANGED: Clean the response to remove thinking tags
+            cleaned_response = self.clean_response(raw_response)
+            return cleaned_response
+            
         except Exception as e:
             print(f"Error calling Groq API: {e}")
-            return "Sorry, I couldn't generate an answer due to an API error."
+            return f"Sorry, I couldn't generate an answer due to an API error: {str(e)}"
 
-    def query(self, question: str, top_k: int = 3) -> Dict[str, Any]:
-        similar_docs = self.search_similar(question, top_k)
-        if not similar_docs:
+    def query(self, question: str, top_k: int = 5) -> Dict[str, Any]:  # CHANGED: Increased top_k
+        try:
+            similar_docs = self.search_similar(question, top_k)
+            if not similar_docs:
+                return {
+                    "answer": "No relevant documents found for this question.",
+                    "context": [],
+                    "query": question,
+                }
+            answer = self.generate_answer(question, similar_docs)
+            return {"answer": answer, "context": similar_docs, "query": question}
+        except Exception as e:
             return {
-                "answer": "No relevant documents found.",
+                "answer": f"Error processing query: {str(e)}",
                 "context": [],
                 "query": question,
             }
-        answer = self.generate_answer(question, similar_docs)
-        return {"answer": answer, "context": similar_docs, "query": question}
-
 
 # ---------------- API ENDPOINT -----------------
 
@@ -213,35 +256,51 @@ async def run_hackrx(payload: HackRxRequest, token: str = Depends(verify_token))
     Returns: {"answers": [ ... ]}
     """
     try:
+        print(f"Received request with PDF URL: {payload.documents}")
+        print(f"Number of questions: {len(payload.questions)}")
+        
         # Download the PDF file to a temp file
         temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         pdf_url = str(payload.documents)
-        response = requests.get(pdf_url)
+        
+        print(f"Downloading PDF from: {pdf_url}")
+        response = requests.get(pdf_url, timeout=30)
         if not response.ok:
-            raise HTTPException(status_code=400, detail="PDF could not be downloaded from the provided url.")
+            raise HTTPException(status_code=400, detail=f"PDF could not be downloaded. Status: {response.status_code}")
+        
         temp_pdf.write(response.content)
         temp_pdf.close()
         pdf_path = temp_pdf.name
+        
+        print(f"PDF downloaded to: {pdf_path}")
 
         # Build the RAG pipeline for this PDF
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY not found in environment variables")
+            
         rag = RAGPipeline(GROQ_API_KEY)
-        rag.process_pdf(pdf_path, chunk_size=40, overlap=5)
+        print("Processing PDF...")
+        rag.process_pdf(pdf_path, chunk_size=200, overlap=50)  # CHANGED: Better chunk sizes
+        print(f"PDF processed. Created {len(rag.documents)} document chunks.")
 
         answers = []
-        for q in payload.questions:
+        for i, q in enumerate(payload.questions):
+            print(f"Processing question {i+1}: {q}")
             result = rag.query(q)
             answers.append(result["answer"])
+            print(f"Answer {i+1}: {result['answer'][:100]}...")
 
         # Clean up
         os.remove(pdf_path)
+        print("Temporary PDF file cleaned up.")
 
         return HackRxResponse(answers=answers)
+        
     except Exception as ex:
-        raise HTTPException(status_code=500, detail=str(ex))
+        print(f"Error in run_hackrx: {str(ex)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(ex)}")
 
-
-# ---------------- RUN INSTRUCTIONS -------------
-# To run locally (from folder with your code): 
-# uvicorn main:app --host 0.0.0.0 --port 5001 --reload
-
-# To test in Postman or curl: Supply the endpoint, your Bearer token, the 'documents' field (PDF URL), and a list of 'questions'.
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "message": "HackRx RAG API is running"}
