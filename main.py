@@ -11,7 +11,7 @@ import PyPDF2
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+from openai import OpenAI
 
 from dotenv import load_dotenv
 
@@ -47,7 +47,6 @@ class HackRxRequest(BaseModel):
 class HackRxResponse(BaseModel):
     answers: List[str]
 
-# ------------ RAG PIPELINE SECTION ---------------
 
 @dataclass
 class Document:
@@ -57,11 +56,11 @@ class Document:
     end_idx: int
 
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 class RAGPipeline:
-    def __init__(self, groq_api_key: str, embedding_model: str = "all-MiniLM-L6-v2"):
-        self.groq_client = Groq(api_key=groq_api_key)
+    def __init__(self, openai_api_key: str, embedding_model: str = "all-MiniLM-L6-v2"):
+        self.openai_client = OpenAI(api_key=openai_api_key)
         self.embedding_model = SentenceTransformer(embedding_model)
         self.documents = []
         self.embeddings = None
@@ -91,7 +90,7 @@ class RAGPipeline:
         text = text.strip()
         return text
 
-    def chunk_text(self, text: str, chunk_size: int = 200, overlap: int = 50) -> List[Document]:  # CHANGED: Increased chunk size
+    def chunk_text(self, text: str, chunk_size: int = 50, overlap: int = 5) -> List[Document]:
         documents = []
         words = text.split()
         for i in range(0, len(words), chunk_size - overlap):
@@ -117,7 +116,7 @@ class RAGPipeline:
         self.faiss_index = faiss.IndexFlatL2(dimension)
         self.faiss_index.add(embeddings.astype("float32"))
 
-    def process_pdf(self, pdf_path: str, chunk_size: int = 200, overlap: int = 50):  # CHANGED: Updated defaults
+    def process_pdf(self, pdf_path: str, chunk_size: int = 50, overlap: int = 5):
         raw_text = self.read_pdf(pdf_path)
         if not raw_text:
             raise Exception("No text could be extracted from the PDF.")
@@ -141,7 +140,7 @@ class RAGPipeline:
         combined_context = " ... ".join(contexts)
         return combined_context
 
-    def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:  # CHANGED: Increased top_k
+    def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         if self.faiss_index is None:
             raise Exception("FAISS index not built.")
         query_embedding = self.embedding_model.encode([query])
@@ -162,7 +161,6 @@ class RAGPipeline:
                 })
         return results
 
-    # CHANGED: Completely updated prompt and response cleaning
     def clean_response(self, response_text: str) -> str:
         """Clean the response by removing <think> tags and formatting properly"""
         # Remove <think>...</think> blocks
@@ -190,7 +188,7 @@ class RAGPipeline:
             context_parts.append(f"Context {doc['rank']}: {doc['context']}")
         combined_context = "\n\n".join(context_parts)
         
-        # CHANGED: Improved prompt to get direct, concise answers
+        # Improved prompt to get direct, concise answers
         prompt = f"""You are an insurance policy expert. Based on the provided context, answer the question directly and concisely.
 
 Context:
@@ -206,8 +204,8 @@ Instructions:
 - Do not include reasoning or thought processes in your response"""
         
         try:
-            response = self.groq_client.chat.completions.create(
-                model="deepseek-r1-distill-llama-70b",
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",  # Using GPT-4o-mini for good performance and cost efficiency
                 messages=[
                     { 
                         "role": "system", 
@@ -215,20 +213,20 @@ Instructions:
                     },
                     { "role": "user", "content": prompt },
                 ],
-                temperature=0.0,  # CHANGED: Set to 0 for more consistent outputs
-                max_tokens=500,   # CHANGED: Reduced for more concise answers
+                temperature=0.0,  # Set to 0 for more consistent outputs
+                max_tokens=250,   # Reduced for more concise answers
             )
             
             raw_response = response.choices[0].message.content
-            # CHANGED: Clean the response to remove thinking tags
+            # Clean the response to remove thinking tags
             cleaned_response = self.clean_response(raw_response)
             return cleaned_response
             
         except Exception as e:
-            print(f"Error calling Groq API: {e}")
+            print(f"Error calling OpenAI API: {e}")
             return f"Sorry, I couldn't generate an answer due to an API error: {str(e)}"
 
-    def query(self, question: str, top_k: int = 5) -> Dict[str, Any]:  # CHANGED: Increased top_k
+    def query(self, question: str, top_k: int = 5) -> Dict[str, Any]:
         try:
             similar_docs = self.search_similar(question, top_k)
             if not similar_docs:
@@ -246,7 +244,6 @@ Instructions:
                 "query": question,
             }
 
-# ---------------- API ENDPOINT -----------------
 
 @app.post('/hackrx/run', response_model=HackRxResponse)
 async def run_hackrx(payload: HackRxRequest, token: str = Depends(verify_token)):
@@ -275,12 +272,12 @@ async def run_hackrx(payload: HackRxRequest, token: str = Depends(verify_token))
         print(f"PDF downloaded to: {pdf_path}")
 
         # Build the RAG pipeline for this PDF
-        if not GROQ_API_KEY:
-            raise HTTPException(status_code=500, detail="GROQ_API_KEY not found in environment variables")
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found in environment variables")
             
-        rag = RAGPipeline(GROQ_API_KEY)
+        rag = RAGPipeline(OPENAI_API_KEY)
         print("Processing PDF...")
-        rag.process_pdf(pdf_path, chunk_size=200, overlap=50)  # CHANGED: Better chunk sizes
+        rag.process_pdf(pdf_path, chunk_size=50, overlap=5)
         print(f"PDF processed. Created {len(rag.documents)} document chunks.")
 
         answers = []
