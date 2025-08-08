@@ -1,52 +1,39 @@
+# config/settings.py
 import os
-import re
-import pickle
-import tempfile
-import requests
-from typing import List, Dict, Any
-from pathlib import Path
-from dataclasses import dataclass
-
-import PyPDF2
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-
 from dotenv import load_dotenv
 
-# ---------- FASTAPI + SECURITY SECTION ------------
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, HttpUrl
+load_dotenv()
 
-#### ---- AUTH SETTINGS ---- ####
-API_KEY = "f5b00b57698f28dbb878319109a149d5cd0a7d430c25cf3c590b30d31cf8b028"
+class Settings:
+    # API Configuration
+    API_KEY = "f5b00b57698f28dbb878319109a149d5cd0a7d430c25cf3c590b30d31cf8b028"
+    API_TITLE = "HackRx RAG API"
+    API_DESCRIPTION = "API to process document and answer insurance queries using RAG pipeline."
+    API_VERSION = "1.0.0"
+    
+    # OpenAI Configuration
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL = "gpt-4o-mini"
+    
+    # RAG Configuration
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    CHUNK_SIZE = 100  # Increased for better context
+    CHUNK_OVERLAP = 20  # Increased for better continuity
+    TOP_K_RESULTS = 7  # Increased for more context
+    CONTEXT_WINDOW_SIZE = 150  # Increased for better context
+    
+    # Generation Configuration
+    TEMPERATURE = 0.0
+    MAX_TOKENS = 300  # Increased for more detailed answers
+    DOWNLOAD_TIMEOUT = 60  # Increased timeout
 
-app = FastAPI(
-    title="HackRx RAG API",
-    description="API to process document and answer insurance queries using RAG pipeline.",
-    version="1.0.0"
-)
+settings = Settings()
 
-auth_scheme = HTTPBearer()
+# ================================================
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
-    if not credentials or credentials.scheme != "Bearer" or credentials.credentials != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing Bearer token.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return credentials
-
-class HackRxRequest(BaseModel):
-    documents: HttpUrl
-    questions: List[str]
-
-class HackRxResponse(BaseModel):
-    answers: List[str]
-
+# models/document.py
+from dataclasses import dataclass
+from typing import List
 
 @dataclass
 class Document:
@@ -54,250 +41,503 @@ class Document:
     page_num: int
     start_idx: int
     end_idx: int
+    
+    def __post_init__(self):
+        """Validate document content"""
+        if not self.content or not self.content.strip():
+            raise ValueError("Document content cannot be empty")
 
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ================================================
 
-class RAGPipeline:
-    def __init__(self, openai_api_key: str, embedding_model: str = "all-MiniLM-L6-v2"):
-        self.openai_client = OpenAI(api_key=openai_api_key)
-        self.embedding_model = SentenceTransformer(embedding_model)
-        self.documents = []
-        self.embeddings = None
-        self.faiss_index = None
+# models/schemas.py
+from pydantic import BaseModel, HttpUrl, validator
+from typing import List
 
+class HackRxRequest(BaseModel):
+    documents: HttpUrl
+    questions: List[str]
+    
+    @validator('questions')
+    def validate_questions(cls, v):
+        if not v:
+            raise ValueError("Questions list cannot be empty")
+        if len(v) > 20:  # Reasonable limit
+            raise ValueError("Maximum 20 questions allowed")
+        return v
+
+class HackRxResponse(BaseModel):
+    answers: List[str]
+    
+class HealthResponse(BaseModel):
+    status: str
+    message: str
+
+# ================================================
+
+# utils/pdf_processor.py
+import PyPDF2
+import re
+from typing import List
+from models.document import Document
+
+class PDFProcessor:
+    def __init__(self):
+        pass
+    
     def read_pdf(self, pdf_path: str) -> str:
+        """Extract text from PDF file"""
         text = ""
         try:
             with open(pdf_path, "rb") as file:
                 pdf_reader = PyPDF2.PdfReader(file)
+                total_pages = len(pdf_reader.pages)
+                
                 for page_num, page in enumerate(pdf_reader.pages):
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += f"\n--- Page {page_num + 1} ---\n"
-                        text += page_text
+                    try:
+                        page_text = page.extract_text()
+                        if page_text and page_text.strip():
+                            text += f"\n--- Page {page_num + 1} of {total_pages} ---\n"
+                            text += page_text
+                    except Exception as e:
+                        print(f"Error reading page {page_num + 1}: {e}")
+                        continue
+                        
         except Exception as e:
-            print(f"Error reading PDF: {e}")
-            return ""
+            raise Exception(f"Error reading PDF: {e}")
+        
+        if not text.strip():
+            raise Exception("No readable text found in PDF")
+            
         return text
 
     def clean_text(self, text: str) -> str:
+        """Clean and normalize text"""
+        if not text:
+            return ""
+            
+        # Normalize whitespace
         text = re.sub(r"\n+", "\n", text)
         text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"[^\w\s\.\,\!\?\;\:\-\(\)\'\"\/]", "", text)
-        text = re.sub(r"--- Page \d+ ---", "", text)
+        
+        # Remove special characters but keep punctuation
+        text = re.sub(r"[^\w\s\.\,\!\?\;\:\-\(\)\'\"\/\%\$]", "", text)
+        
+        # Remove page markers
+        text = re.sub(r"--- Page \d+ of \d+ ---", "", text)
+        
+        # Final cleanup
         text = re.sub(r"\s+", " ", text)
         text = text.strip()
+        
         return text
 
-    def chunk_text(self, text: str, chunk_size: int = 50, overlap: int = 5) -> List[Document]:
+    def chunk_text(self, text: str, chunk_size: int = 100, overlap: int = 20) -> List[Document]:
+        """Split text into overlapping chunks"""
+        if not text:
+            return []
+            
         documents = []
-        words = text.split()
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk_words = words[i : i + chunk_size]
-            chunk_text = " ".join(chunk_words)
-            if len(chunk_text.strip()) > 0:
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        current_chunk = []
+        current_word_count = 0
+        start_idx = 0
+        
+        for sentence in sentences:
+            sentence_words = sentence.split()
+            
+            # If adding this sentence exceeds chunk size, create a document
+            if current_word_count + len(sentence_words) > chunk_size and current_chunk:
+                chunk_text = " ".join(current_chunk)
+                if chunk_text.strip():
+                    doc = Document(
+                        content=chunk_text.strip(),
+                        page_num=0,
+                        start_idx=start_idx,
+                        end_idx=start_idx + current_word_count
+                    )
+                    documents.append(doc)
+                
+                # Start new chunk with overlap
+                overlap_sentences = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                current_chunk = overlap_sentences + [sentence]
+                current_word_count = sum(len(s.split()) for s in current_chunk)
+                start_idx += current_word_count - sum(len(s.split()) for s in overlap_sentences)
+            else:
+                current_chunk.append(sentence)
+                current_word_count += len(sentence_words)
+        
+        # Add the last chunk
+        if current_chunk:
+            chunk_text = " ".join(current_chunk)
+            if chunk_text.strip():
                 doc = Document(
+                    content=chunk_text.strip(),
                     page_num=0,
-                    content=chunk_text,
-                    start_idx=i,
-                    end_idx=min(i + chunk_size, len(words))
+                    start_idx=start_idx,
+                    end_idx=start_idx + current_word_count
                 )
                 documents.append(doc)
+        
         return documents
 
+# ================================================
+
+# utils/embeddings.py
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Any
+from models.document import Document
+
+class EmbeddingManager:
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(model_name)
+        self.faiss_index = None
+        
     def create_embeddings(self, documents: List[Document]) -> np.ndarray:
+        """Create embeddings for documents"""
+        if not documents:
+            return np.array([])
+            
         texts = [doc.content for doc in documents]
-        embeddings = self.embedding_model.encode(texts, show_progress_bar=False)
-        return embeddings
+        try:
+            embeddings = self.model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
+            return embeddings
+        except Exception as e:
+            raise Exception(f"Error creating embeddings: {e}")
 
     def build_faiss_index(self, embeddings: np.ndarray):
+        """Build FAISS index for similarity search"""
+        if embeddings.size == 0:
+            raise Exception("Cannot build index with empty embeddings")
+            
         dimension = embeddings.shape[1]
-        self.faiss_index = faiss.IndexFlatL2(dimension)
+        # Use IndexFlatIP for cosine similarity with normalized embeddings
+        self.faiss_index = faiss.IndexFlatIP(dimension)
         self.faiss_index.add(embeddings.astype("float32"))
 
-    def process_pdf(self, pdf_path: str, chunk_size: int = 50, overlap: int = 5):
-        raw_text = self.read_pdf(pdf_path)
-        if not raw_text:
-            raise Exception("No text could be extracted from the PDF.")
-        clean_text = self.clean_text(raw_text)
-        self.documents = self.chunk_text(clean_text, chunk_size, overlap)
-        self.embeddings = self.create_embeddings(self.documents)
-        self.build_faiss_index(self.embeddings)
-
-    def get_context_window(self, text: str, query_words: List[str], context_size: int = 100) -> str:
-        words = text.split()
-        contexts = []
-        for query_word in query_words:
-            query_word_lower = query_word.lower()
-            for i, word in enumerate(words):
-                if query_word_lower in word.lower():
-                    start_idx = max(0, i - context_size)
-                    end_idx = min(len(words), i + context_size + 1)
-                    context = " ".join(words[start_idx:end_idx])
-                    contexts.append(context)
-                    break
-        combined_context = " ... ".join(contexts)
-        return combined_context
-
-    def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_similar(self, query: str, documents: List[Document], top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar documents"""
         if self.faiss_index is None:
-            raise Exception("FAISS index not built.")
-        query_embedding = self.embedding_model.encode([query])
-        distances, indices = self.faiss_index.search(query_embedding.astype("float32"), top_k)
-        
-        results = []
-        for i, (distance, idx) in enumerate(zip(distances[0], indices[0])):
-            if idx != -1 and idx < len(self.documents):
-                doc = self.documents[idx]
-                query_words = query.split()
-                context = self.get_context_window(doc.content, query_words, context_size=100)
-                results.append({
-                    "content": doc.content,
-                    "context": context,
-                    "score": float(distance),
-                    "rank": i + 1,
-                    "doc_index": int(idx),
-                })
-        return results
+            raise Exception("FAISS index not built")
+            
+        if not query.strip():
+            return []
+            
+        try:
+            query_embedding = self.model.encode([query], normalize_embeddings=True)
+            scores, indices = self.faiss_index.search(query_embedding.astype("float32"), min(top_k, len(documents)))
+            
+            results = []
+            for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+                if idx != -1 and idx < len(documents):
+                    doc = documents[idx]
+                    results.append({
+                        "content": doc.content,
+                        "score": float(score),
+                        "rank": i + 1,
+                        "doc_index": int(idx),
+                    })
+            
+            return results
+        except Exception as e:
+            raise Exception(f"Error in similarity search: {e}")
+
+# ================================================
+
+# services/llm_service.py
+import re
+from openai import OpenAI
+from typing import List, Dict, Any
+
+class LLMService:
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        if not api_key:
+            raise ValueError("OpenAI API key is required")
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
 
     def clean_response(self, response_text: str) -> str:
-        """Clean the response by removing <think> tags and formatting properly"""
-        # Remove <think>...</think> blocks
+        """Clean the response by removing unwanted tags and formatting"""
+        if not response_text:
+            return "The information requested could not be found in the provided context."
+            
+        # Remove thinking tags and other artifacts
         cleaned = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL)
+        cleaned = re.sub(r'<reasoning>.*?</reasoning>', '', cleaned, flags=re.DOTALL)
         
-        # Remove extra whitespace and newlines
+        # Normalize whitespace
         cleaned = re.sub(r'\n+', ' ', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned)
         
-        # Clean up any remaining artifacts
+        # Clean up
         cleaned = cleaned.strip()
         
-        # If response is empty after cleaning, return a default message
         if not cleaned:
             return "The information requested could not be found in the provided context."
         
         return cleaned
 
-    def generate_answer(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
+    def generate_answer(self, query: str, context_docs: List[Dict[str, Any]], 
+                       temperature: float = 0.0, max_tokens: int = 300) -> str:
+        """Generate answer using OpenAI API"""
         if not context_docs:
             return "No relevant context found to answer the question."
             
+        # Combine context with better formatting
         context_parts = []
-        for doc in context_docs:
-            context_parts.append(f"Context {doc['rank']}: {doc['context']}")
+        for doc in context_docs[:5]:  # Limit to top 5 for token efficiency
+            context_parts.append(f"[Context {doc['rank']}]: {doc['content']}")
+        
         combined_context = "\n\n".join(context_parts)
         
-        # Improved prompt to get direct, concise answers
-        prompt = f"""You are an insurance policy expert. Based on the provided context, answer the question directly and concisely.
+        # Improved prompt for better answers
+        prompt = f"""You are an expert insurance policy analyst. Answer the question based ONLY on the provided context.
 
-Context:
+CONTEXT:
 {combined_context}
 
-Question: {query}
+QUESTION: {query}
 
-Instructions:
-- Provide a direct, factual answer
-- Be specific with numbers, periods, and conditions when mentioned
-- Keep the answer concise but complete
-- If specific details aren't in the context, state that clearly
-- Do not include reasoning or thought processes in your response"""
+INSTRUCTIONS:
+1. Provide a direct, accurate answer based on the context
+2. Include specific details like numbers, periods, percentages when available
+3. If information is partially available, state what you know and what's unclear
+4. If the context doesn't contain relevant information, clearly state this
+5. Keep your answer concise but complete
+6. Do not make assumptions beyond what's stated in the context
+
+ANSWER:"""
         
         try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",  # Using GPT-4o-mini for good performance and cost efficiency
+            response = self.client.chat.completions.create(
+                model=self.model,
                 messages=[
-                    { 
+                    {
                         "role": "system", 
-                        "content": "You are a helpful insurance policy assistant. Provide direct, concise answers based only on the provided context. Do not show your reasoning process." 
+                        "content": "You are a precise insurance policy assistant. Answer only based on provided context. Be direct and factual."
                     },
-                    { "role": "user", "content": prompt },
+                    {"role": "user", "content": prompt}
                 ],
-                temperature=0.0,  # Set to 0 for more consistent outputs
-                max_tokens=250,   # Reduced for more concise answers
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
             
             raw_response = response.choices[0].message.content
-            # Clean the response to remove thinking tags
             cleaned_response = self.clean_response(raw_response)
             return cleaned_response
             
         except Exception as e:
-            print(f"Error calling OpenAI API: {e}")
-            return f"Sorry, I couldn't generate an answer due to an API error: {str(e)}"
+            return f"Error generating answer: {str(e)}"
 
-    def query(self, question: str, top_k: int = 5) -> Dict[str, Any]:
+# ================================================
+
+# services/rag_service.py
+import tempfile
+import requests
+import os
+from typing import List, Dict, Any
+from utils.pdf_processor import PDFProcessor
+from utils.embeddings import EmbeddingManager
+from services.llm_service import LLMService
+from config.settings import settings
+
+class RAGService:
+    def __init__(self):
+        self.pdf_processor = PDFProcessor()
+        self.embedding_manager = EmbeddingManager(settings.EMBEDDING_MODEL)
+        self.llm_service = LLMService(settings.OPENAI_API_KEY, settings.OPENAI_MODEL)
+        self.documents = []
+        
+    def download_pdf(self, pdf_url: str) -> str:
+        """Download PDF from URL to temporary file"""
         try:
-            similar_docs = self.search_similar(question, top_k)
+            temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            
+            response = requests.get(pdf_url, timeout=settings.DOWNLOAD_TIMEOUT)
+            response.raise_for_status()
+            
+            temp_pdf.write(response.content)
+            temp_pdf.close()
+            
+            return temp_pdf.name
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Failed to download PDF: {e}")
+        except Exception as e:
+            raise Exception(f"Error downloading PDF: {e}")
+    
+    def process_document(self, pdf_url: str) -> int:
+        """Process PDF document and build search index"""
+        pdf_path = None
+        try:
+            # Download PDF
+            pdf_path = self.download_pdf(pdf_url)
+            
+            # Extract text
+            raw_text = self.pdf_processor.read_pdf(pdf_path)
+            clean_text = self.pdf_processor.clean_text(raw_text)
+            
+            # Create document chunks
+            self.documents = self.pdf_processor.chunk_text(
+                clean_text, 
+                settings.CHUNK_SIZE, 
+                settings.CHUNK_OVERLAP
+            )
+            
+            if not self.documents:
+                raise Exception("No valid document chunks created")
+            
+            # Create embeddings and build index
+            embeddings = self.embedding_manager.create_embeddings(self.documents)
+            self.embedding_manager.build_faiss_index(embeddings)
+            
+            return len(self.documents)
+            
+        finally:
+            # Cleanup temp file
+            if pdf_path and os.path.exists(pdf_path):
+                try:
+                    os.remove(pdf_path)
+                except Exception as e:
+                    print(f"Warning: Could not remove temp file {pdf_path}: {e}")
+    
+    def query(self, question: str) -> Dict[str, Any]:
+        """Query the RAG system"""
+        try:
+            if not self.documents:
+                return {
+                    "answer": "No documents have been processed yet.",
+                    "query": question,
+                    "context_used": 0
+                }
+            
+            # Search for similar documents
+            similar_docs = self.embedding_manager.search_similar(
+                question, 
+                self.documents, 
+                settings.TOP_K_RESULTS
+            )
+            
             if not similar_docs:
                 return {
                     "answer": "No relevant documents found for this question.",
-                    "context": [],
                     "query": question,
+                    "context_used": 0
                 }
-            answer = self.generate_answer(question, similar_docs)
-            return {"answer": answer, "context": similar_docs, "query": question}
+            
+            # Generate answer
+            answer = self.llm_service.generate_answer(
+                question, 
+                similar_docs,
+                settings.TEMPERATURE,
+                settings.MAX_TOKENS
+            )
+            
+            return {
+                "answer": answer,
+                "query": question,
+                "context_used": len(similar_docs)
+            }
+            
         except Exception as e:
             return {
                 "answer": f"Error processing query: {str(e)}",
-                "context": [],
                 "query": question,
+                "context_used": 0
             }
 
+# ================================================
+
+# auth/security.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from config.settings import settings
+
+auth_scheme = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+    """Verify Bearer token"""
+    if (not credentials or 
+        credentials.scheme != "Bearer" or 
+        credentials.credentials != settings.API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing Bearer token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials
+
+# ================================================
+
+# main.py
+from fastapi import FastAPI, Depends, HTTPException, status
+from models.schemas import HackRxRequest, HackRxResponse, HealthResponse
+from services.rag_service import RAGService
+from auth.security import verify_token
+from config.settings import settings
+
+app = FastAPI(
+    title=settings.API_TITLE,
+    description=settings.API_DESCRIPTION,
+    version=settings.API_VERSION
+)
 
 @app.post('/hackrx/run', response_model=HackRxResponse)
 async def run_hackrx(payload: HackRxRequest, token: str = Depends(verify_token)):
     """
-    Receives a PDF url and a list of questions.
-    For each question, it extracts the document, runs RAG, and produces the answers.
-    Returns: {"answers": [ ... ]}
+    Process PDF document and answer questions using RAG pipeline.
     """
     try:
         print(f"Received request with PDF URL: {payload.documents}")
         print(f"Number of questions: {len(payload.questions)}")
         
-        # Download the PDF file to a temp file
-        temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        pdf_url = str(payload.documents)
+        # Validate OpenAI API key
+        if not settings.OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="OpenAI API key not configured"
+            )
         
-        print(f"Downloading PDF from: {pdf_url}")
-        response = requests.get(pdf_url, timeout=30)
-        if not response.ok:
-            raise HTTPException(status_code=400, detail=f"PDF could not be downloaded. Status: {response.status_code}")
+        # Initialize RAG service
+        rag_service = RAGService()
         
-        temp_pdf.write(response.content)
-        temp_pdf.close()
-        pdf_path = temp_pdf.name
-        
-        print(f"PDF downloaded to: {pdf_path}")
-
-        # Build the RAG pipeline for this PDF
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not found in environment variables")
-            
-        rag = RAGPipeline(OPENAI_API_KEY)
+        # Process document
         print("Processing PDF...")
-        rag.process_pdf(pdf_path, chunk_size=50, overlap=5)
-        print(f"PDF processed. Created {len(rag.documents)} document chunks.")
-
+        num_chunks = rag_service.process_document(str(payload.documents))
+        print(f"PDF processed. Created {num_chunks} document chunks.")
+        
+        # Process questions
         answers = []
-        for i, q in enumerate(payload.questions):
-            print(f"Processing question {i+1}: {q}")
-            result = rag.query(q)
+        for i, question in enumerate(payload.questions):
+            print(f"Processing question {i+1}/{len(payload.questions)}: {question[:50]}...")
+            
+            result = rag_service.query(question)
             answers.append(result["answer"])
+            
             print(f"Answer {i+1}: {result['answer'][:100]}...")
-
-        # Clean up
-        os.remove(pdf_path)
-        print("Temporary PDF file cleaned up.")
-
+        
+        print("All questions processed successfully.")
         return HackRxResponse(answers=answers)
         
-    except Exception as ex:
-        print(f"Error in run_hackrx: {str(ex)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(ex)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in run_hackrx: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal server error: {str(e)}"
+        )
 
-# Health check endpoint
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "healthy", "message": "HackRx RAG API is running"}
+    """Health check endpoint"""
+    return HealthResponse(
+        status="healthy", 
+        message="HackRx RAG API is running"
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
